@@ -10,20 +10,303 @@
 # You should have received a copy of the GNU General Public License along with this program.
 # If not, see <https://www.gnu.org/licenses/>.
 
+
+# -----------------------------------------------------------------------------
+# BEGINNER-FRIENDLY EXPLANATION / USER GUIDE
+# -----------------------------------------------------------------------------
+#
+# What this script does, in one sentence
+# --------------------------------------
+# This script reads a monthly groundwater-level dataset with missing values,
+# fills the missing monthly Water Surface Elevation (WSE) values using a
+# group-wise K-Nearest Neighbors (KNN) imputation workflow, and then saves both
+# the completed data tables and diagnostic time-series graphs.
+#
+# Why this script exists
+# ----------------------
+# Groundwater monitoring records often contain missing months. These gaps can
+# occur because a sensor failed, telemetry stopped, access to the well was not
+# possible, a quality-control procedure removed a measurement, or the monthly
+# value was simply not reported. Many downstream groundwater analyses need a
+# continuous monthly series: drought diagnostics, seasonal minimum/maximum
+# analyses, trend calculations, model calibration, forecasting, and dashboards.
+#
+# This script provides a transparent baseline way to complete those gaps using
+# only the groundwater-level records themselves. It does NOT require rainfall,
+# pumping, remote sensing, aquifer-test data, lithologic logs, or any external
+# covariates. That is useful when the goal is to prepare a large monitoring
+# archive in a reproducible and auditable way.
+#
+# Required input file
+# -------------------
+# The script expects one CSV file in the same working directory:
+#
+#     gwl-monthly.grouped.csv
+#
+# The CSV must contain at least these columns:
+#
+#     MSMT_DATE   : date of the monthly observation. Example: 2018-12-01
+#     STATION     : unique well/station identifier. Example: 10N04E27R002M
+#     GROUP       : group identifier used to decide which wells can borrow
+#                   information from each other. In the manuscript this is the
+#                   PLSS-prefix group, but it can also be any user-defined group.
+#     WSE         : Water Surface Elevation. Missing values should be blank or NaN.
+#
+# Very important: this script uses the GROUP column as the donor-pool boundary.
+# A well is imputed only together with wells in the same GROUP. If the GROUP
+# column is poorly defined, the imputation may also be poor. For other datasets,
+# GROUP can be based on aquifer code, basin ID, management zone, distance-based
+# neighborhood, or correlation-based clustering.
+#
+# Main idea of the method
+# -----------------------
+# KNN imputation fills a missing value by searching for similar rows and taking a
+# weighted average of their observed values. In this script, similarity is not
+# based only on the date. The script builds a feature table that includes:
+#
+#     1. MONTH and YEAR
+#        These help encode the seasonal timing and long-term temporal position.
+#
+#     2. WSE
+#        The observed water level itself, where available.
+#
+#     3. LAG_1
+#        The groundwater level one month earlier for the same station.
+#
+#     4. LAG_2
+#        The groundwater level two months earlier for the same station.
+#
+#     5. ROLLING_MEAN
+#        A 3-month rolling mean. This is a compact local baseline.
+#
+#     6. ROLLING_STD
+#        A 3-month rolling standard deviation. This is a compact local variability
+#        descriptor.
+#
+# The KNNImputer then searches in this engineered feature space. Rows that are
+# closer in this feature space are treated as more similar. Because the imputer is
+# used with weights="distance", closer neighbors have more influence than farther
+# neighbors.
+#
+# What "group-wise" means
+# -----------------------
+# The script does not run one single KNN model on the entire 515-well network.
+# Instead, it loops over each GROUP separately:
+#
+#     for each GROUP:
+#         take all wells in that group
+#         create lag and rolling features
+#         pivot the data into a wide table
+#         run KNNImputer inside that group
+#         return completed values for the wells in that group
+#
+# This reduces the risk that a well in one hydrogeologic setting borrows values
+# from a completely unrelated well somewhere else. It also keeps the computation
+# smaller and easier to inspect.
+#
+# What happens to single-well groups
+# ----------------------------------
+# Some groups contain only one well. If a single-well group has no missing WSE
+# values, the script removes it from the imputation run because there is nothing
+# to fill. If a single-well group contains missing values, it remains in the
+# workflow. In that case, KNN cannot borrow from neighboring wells, so it relies
+# only on temporal self-similarity through MONTH/YEAR, lag features, and rolling
+# statistics. These estimates should be interpreted more cautiously than estimates
+# supported by coherent multiwell groups.
+#
+# Observation-window trimming
+# ---------------------------
+# The script removes rows before the first observed WSE and after the last
+# observed WSE for each station. This is important because the goal is internal
+# gap filling, not extrapolation. In other words:
+#
+#     OK:   fill missing months between the first and last observed month.
+#     NOT:  invent values before monitoring began or after monitoring ended.
+#
+# How missing values are marked
+# -----------------------------
+# The script creates a column named:
+#
+#     was_missing
+#
+# This is True for months that were missing in the original WSE column and were
+# therefore filled by the imputation workflow. It is False for months that were
+# originally observed. This column is essential for auditability because it lets a
+# user distinguish measured values from estimated values.
+#
+# Main output table
+# -----------------
+# The most important output file is:
+#
+#     gwl-monthly-imputed-KNN.csv
+#
+# It contains, for each station and month:
+#
+#     MSMT_DATE    : monthly date
+#     WSE          : original value; observed months have numbers, missing months
+#                    remain missing
+#     STATION      : well identifier
+#     GROUP        : donor-pool group identifier
+#     WSE_imputed  : KNN-imputed value returned by the imputer
+#     was_missing  : True if the original WSE was missing
+#     WSE_final    : final completed series. This equals WSE for observed months
+#                    and equals WSE_imputed for originally missing months.
+#
+# The safest column for downstream analyses is usually WSE_final, because it is
+# the completed series. However, WSE and was_missing should always be retained so
+# users can tell which values were measured and which were estimated.
+#
+# Output folders
+# --------------
+# The script creates four output folders if they do not already exist:
+#
+#     time_series_graphs_KNN/
+#         One PNG graph per station. These graphs show observed and infilled
+#         values in the completed time series.
+#
+#     infilled_data_KNN/
+#         One CSV file per station containing the completed station-level data.
+#
+#     estimated_data_KNN/
+#         One CSV file per station containing only the months that were actually
+#         estimated. Stations without missing values may not produce a file here.
+#
+#     group_time_series_graphs_KNN/
+#         One PNG graph per group, with all wells in that group plotted together.
+#         These plots are useful for visually checking whether the group behaves
+#         coherently and whether infilled values look plausible.
+#
+# How the station-level graphs should be read
+# -------------------------------------------
+# In the station graphs:
+#
+#     blue markers/segments generally indicate observed portions of the series.
+#     red/firebrick markers indicate infilled months.
+#     light-salmon connecting lines highlight segments involving at least one
+#     imputed value.
+#
+# These plots are not just decorative. They are diagnostic plots. A hydrologist or
+# data manager should inspect them to check whether imputed months follow the
+# expected seasonal cycle, long-term trend, and neighboring-well behavior.
+#
+# How the group-level graphs should be read
+# -----------------------------------------
+# Group graphs show all stations in the same GROUP together. They are useful for
+# quickly identifying:
+#
+#     - whether wells in the same group move together,
+#     - whether one well behaves very differently from the others,
+#     - whether missing months are simultaneous across wells,
+#     - whether imputation is weak because all wells are missing at the same time,
+#     - whether a group should be split or merged before a future rerun.
+#
+# Important methodological limitation
+# -----------------------------------
+# This script provides deterministic imputed values. It does not provide formal
+# prediction intervals or probabilistic uncertainty. Uncertainty must be assessed
+# separately, for example by using the companion full-network validation script
+# that masks known observed blocks and calculates RMSE, MAE, bias, NSE, R, and R2.
+#
+# Long consecutive gaps
+# ---------------------
+# Lag and rolling features are computed from the original WSE series before KNN
+# imputation. During long consecutive missing gaps, lag and rolling features can
+# become missing because recent observed WSE values are unavailable. KNNImputer
+# can still operate because it uses the subset of jointly available features when
+# computing nan-aware Euclidean distances. However, long gaps are intrinsically
+# harder, especially when neighboring wells are also missing during the same time.
+#
+# What this script does NOT do
+# ----------------------------
+# This script does not:
+#
+#     - prove that the chosen GROUP definitions are hydrologically perfect;
+#     - use pumping, precipitation, land use, lithology, or remote sensing data;
+#     - optimize K automatically for each station;
+#     - quantify formal uncertainty intervals;
+#     - validate performance by itself using masked-gap experiments;
+#     - extrapolate outside a station's monitoring period;
+#     - guarantee that every imputed value is hydrologically correct.
+#
+# Instead, it provides a transparent, reproducible, easy-to-inspect baseline.
+#
+# When to trust the output more
+# -----------------------------
+# Imputed values are generally more credible when:
+#
+#     - the station belongs to a multiwell group,
+#     - neighboring wells have overlapping observations,
+#     - wells in the same group show similar seasonal and long-term behavior,
+#     - missing gaps are not extremely long,
+#     - missing gaps are not simultaneous across all wells in the group,
+#     - the diagnostic graphs look hydrogeologically plausible.
+#
+# When to be cautious
+# -------------------
+# Imputed values should be interpreted cautiously when:
+#
+#     - the well is in a single-well group,
+#     - the group contains wells with very different hydrographs,
+#     - local pumping causes abrupt or irregular changes,
+#     - stratigraphic differences make nearby wells behave differently,
+#     - the missing period is long and coincides with missing data in other wells,
+#     - the imputed values smooth out important minima or maxima.
+#
+# Typical workflow for a new user
+# -------------------------------
+# 1. Put GWMonthlyKNN.py and gwl-monthly.grouped.csv in the same folder.
+# 2. Open Spyder or another Python IDE.
+# 3. Set the working directory to that folder.
+# 4. Run the script.
+# 5. Check that gwl-monthly-imputed-KNN.csv was created.
+# 6. Inspect several station and group graphs.
+# 7. Use WSE_final for downstream analyses, while keeping was_missing for audit.
+# 8. For manuscript-level evidence, run the separate validation script to quantify
+#    performance under artificial 12- and 24-month gaps.
+#
+# Common problems and simple fixes
+# --------------------------------
+# Problem: FileNotFoundError for gwl-monthly.grouped.csv
+# Fix:     Put the CSV in the same folder as this script, or change the read_csv
+#          path below.
+#
+# Problem: KeyError for STATION, GROUP, MSMT_DATE, or WSE
+# Fix:     Check that the input CSV uses exactly these column names.
+#
+# Problem: Date conversion error in MSMT_DATE
+# Fix:     Make sure dates are in a format pandas can parse, such as YYYY-MM-DD.
+#
+# Problem: Empty or strange graphs
+# Fix:     Check whether the station has enough observed WSE values and whether
+#          the GROUP column is correct.
+#
+# Problem: Imputed values look unrealistic
+# Fix:     Inspect the group graph. The group may combine hydrologically different
+#          wells. Try redefining GROUP using aquifer, basin, screened interval,
+#          distance, or correlation information and rerun the script.
+#
+# Reproducibility note
+# --------------------
+# The script is intentionally simple and parameter-light. The main exposed KNN
+# parameter is n_neighbors in knn_group_impute(), defaulting to 5. If you change
+# this value, document the change and rerun validation before using the outputs in
+# a scientific manuscript or operational decision workflow.
+#
+# License note
+# ------------
+# This script is released under the GNU General Public License (GPL), as stated
+# above. Keep the license notice if you redistribute or modify the file.
+#
+# -----------------------------------------------------------------------------
+# END OF BEGINNER-FRIENDLY EXPLANATION
+# -----------------------------------------------------------------------------
+
+
 import pandas as pd
 import numpy as np
 from sklearn.impute import KNNImputer
 import matplotlib.pyplot as plt
 import os
-from matplotlib.colors import ListedColormap, BoundaryNorm
-from matplotlib.patches import Patch
-
-# Progress bar (safe import)
-try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(iterable, **kwargs):
-        return iterable
 
 # Load the data
 data = pd.read_csv('gwl-monthly.grouped.csv')
@@ -35,44 +318,21 @@ data['MSMT_DATE'] = pd.to_datetime(data['MSMT_DATE'])
 stations_with_data = data.groupby('STATION')['WSE'].transform('count') > 0
 data = data[stations_with_data]
 
-
 # Remove lines with no WSE values before the first observation and after the last observation for each station
 def filter_observation_range(group):
     first_obs_index = group['WSE'].first_valid_index()
     last_obs_index = group['WSE'].last_valid_index()
     return group.loc[first_obs_index:last_obs_index]
 
-# --- FIX: pandas DeprecationWarning for GroupBy.apply operating on grouping columns ---
-# New pandas prefers include_groups=False; provide fallback for older versions.
-try:
-    # include_groups=False -> grouping columns (STATION) group frame içine verilmez.
-    # Bu yüzden STATION'ı index seviyesinden geri alıyoruz.
-    data = (data
-            .groupby('STATION', group_keys=True)
-            .apply(filter_observation_range, include_groups=False)
-            .reset_index(level=0)   # STATION'ı sütun olarak geri getirir
-            .reset_index(drop=True))
-except TypeError:
-    # Older pandas: include_groups not supported
-    data = (data
-            .groupby('STATION', group_keys=False)
-            .apply(filter_observation_range)
-            .reset_index(drop=True))
-
-# Güvenlik kontrolü (isterseniz bırakın; sorunu erken yakalar)
-if 'STATION' not in data.columns:
-    raise KeyError("STATION column missing after filtering; check GroupBy.apply settings.")
-
-
+data = data.groupby('STATION').apply(filter_observation_range).reset_index(drop=True)
 
 # Sort the data by station code and then by date within each station
 data = data.sort_values(by=['STATION', 'MSMT_DATE'])
 
 # Filter out groups with a single well where there is no missing value
 group_sizes = data['GROUP'].value_counts()
-single_well_groups = group_sizes[group_sizes == 1].index.tolist()
-
-for group in tqdm(single_well_groups, desc="Filtering single-well groups", unit="group"):
+single_well_groups = group_sizes[group_sizes == 1].index
+for group in single_well_groups:
     if data[data['GROUP'] == group]['WSE'].isnull().sum() == 0:
         data = data[data['GROUP'] != group]
 
@@ -90,77 +350,65 @@ for directory in [output_dir, infilled_data_dir, estimated_data_dir, group_outpu
     if not os.path.exists(directory):
         os.makedirs(directory)
 
-
 # Function to impute missing values using KNN with enhanced features and time decay
 def knn_group_impute(group_data, n_neighbors=5):
     # Create lag features and rolling statistics
     group_data['LAG_1'] = group_data.groupby('STATION')['WSE'].shift(1)
     group_data['LAG_2'] = group_data.groupby('STATION')['WSE'].shift(2)
-    group_data['ROLLING_MEAN'] = group_data.groupby('STATION')['WSE'].transform(
-        lambda x: x.rolling(window=3, min_periods=1).mean()
-    )
-    group_data['ROLLING_STD'] = group_data.groupby('STATION')['WSE'].transform(
-        lambda x: x.rolling(window=3, min_periods=1).std()
-    )
+    group_data['ROLLING_MEAN'] = group_data.groupby('STATION')['WSE'].transform(lambda x: x.rolling(window=3, min_periods=1).mean())
+    group_data['ROLLING_STD'] = group_data.groupby('STATION')['WSE'].transform(lambda x: x.rolling(window=3, min_periods=1).std())
 
-    # Pivot (MONTH, YEAR) index
-    pivot = group_data.pivot(
-        index=['MONTH', 'YEAR'],
-        columns='STATION',
-        values=['WSE', 'LAG_1', 'LAG_2', 'ROLLING_MEAN', 'ROLLING_STD']
-    )
+    # Pivot the data to have stations as columns and include month for seasonality
+    pivot_data = group_data.pivot(index=['MONTH', 'YEAR'], columns='STATION', values=['WSE', 'LAG_1', 'LAG_2', 'ROLLING_MEAN', 'ROLLING_STD'])
+    pivot_data.columns = ['_'.join(col).strip() for col in pivot_data.columns.values]
+    pivot_data = pivot_data.reset_index()
 
-    # Flatten column names
-    pivot.columns = ['_'.join(col).strip() for col in pivot.columns.values]
+    # Use KNN imputer with distance weighting
+    imputer = KNNImputer(n_neighbors=n_neighbors, weights="distance")
+    imputed_data = imputer.fit_transform(pivot_data)
 
-    # >>> CRITICAL FIX (match 2025.01.18):
-    # Put MONTH and YEAR into the feature matrix used by KNNImputer
-    pivot = pivot.reset_index()
-
-    imputer = KNNImputer(n_neighbors=n_neighbors, weights='distance')
-    imputed_data = imputer.fit_transform(pivot)
-
-    # Back to DataFrame + restore (MONTH, YEAR) index
-    imputed_df = pd.DataFrame(imputed_data, columns=pivot.columns).set_index(['MONTH', 'YEAR'])
-
-    return imputed_df
-
-
-# Perform KNN imputation for each group and generate graphs
-final_data_list = []
-
-groups = data['GROUP'].unique().tolist()
-for group in tqdm(groups, desc="Imputing groups (KNN)", unit="group"):
-    group_data = data[data['GROUP'] == group].copy()
-
-    # Mark missing values
-    group_data['was_missing'] = group_data['WSE'].isnull()
-
-    # Impute missing values using KNN
-    imputed_df = knn_group_impute(group_data)
+    # Convert back to DataFrame
+    imputed_df = pd.DataFrame(imputed_data, columns=pivot_data.columns).set_index(['MONTH', 'YEAR'])
 
     # Extract the imputed WSE values
-    wse_columns = [col for col in imputed_df.columns if col.startswith('WSE_')]
-    imputed_wse = imputed_df[wse_columns]
+    imputed_long = imputed_df.filter(like='WSE').reset_index().melt(id_vars=['MONTH', 'YEAR'], var_name='STATION', value_name='WSE_imputed')
 
-    # Map back to original format
-    stations_in_group = group_data['STATION'].unique().tolist()
-    for station in stations_in_group:
-        station_wse_col = f'WSE_{station}'
-        station_data = group_data[group_data['STATION'] == station].copy()
+    # Add 'was_missing' column
+    original_pivot_data = group_data.pivot(index=['MONTH', 'YEAR'], columns='STATION', values='WSE')
+    imputed_long['was_missing'] = original_pivot_data.isnull().melt(value_name='was_missing')['was_missing']
 
-        station_data = station_data.merge(
-            imputed_wse[station_wse_col].reset_index().rename(columns={station_wse_col: 'WSE_imputed'}),
-            on=['MONTH', 'YEAR'],
-            how='left'
-        )
+    # Merge with original date and group information
+    imputed_long['STATION'] = imputed_long['STATION'].str.split('_').str[1]  # Extract station name
+    imputed_long = pd.merge(imputed_long, group_data[['MSMT_DATE', 'MONTH', 'YEAR', 'STATION', 'GROUP']], on=['MONTH', 'YEAR', 'STATION'])
 
-        # Create final series (observed where available, otherwise imputed)
-        station_data['WSE_final'] = station_data['WSE']
-        station_data.loc[station_data['was_missing'], 'WSE_final'] = station_data.loc[
-            station_data['was_missing'], 'WSE_imputed'
-        ]
-        final_data_list.append(station_data)
+    return imputed_long
+
+# Apply KNN imputation to each group
+infilled_data_list = []
+for group in data['GROUP'].unique():
+    group_data = data[data['GROUP'] == group].copy()
+    infilled_group_data = knn_group_impute(group_data)
+    infilled_group_data['GROUP'] = group
+    infilled_data_list.append(infilled_group_data)
+
+# Combine all infilled group data
+infilled_data = pd.concat(infilled_data_list)
+
+# Ensure each station has a single, continuous time series
+final_data_list = []
+for station in infilled_data['STATION'].unique():
+    station_data = infilled_data[infilled_data['STATION'] == station].copy()
+    original_data = data[data['STATION'] == station].copy()
+    
+    # Limit to the range of observations
+    first_obs_date = original_data['MSMT_DATE'].min()
+    last_obs_date = original_data['MSMT_DATE'].max()
+    station_data = station_data[(station_data['MSMT_DATE'] >= first_obs_date) & (station_data['MSMT_DATE'] <= last_obs_date)]
+    
+    station_data = pd.merge(original_data[['MSMT_DATE', 'WSE', 'STATION', 'GROUP']], station_data[['MSMT_DATE', 'WSE_imputed', 'was_missing']], on='MSMT_DATE', how='left')
+    station_data['WSE_final'] = station_data['WSE']
+    station_data.loc[station_data['was_missing'], 'WSE_final'] = station_data.loc[station_data['was_missing'], 'WSE_imputed']
+    final_data_list.append(station_data)
 
 # Combine final station data
 final_data = pd.concat(final_data_list)
@@ -168,278 +416,41 @@ final_data = pd.concat(final_data_list)
 # Save the infilled dataset
 final_data.to_csv('gwl-monthly-imputed-KNN.csv', index=False)
 
+# Function to generate time series graphs for each station
+def generate_time_series_graphs(station_data, station_name):
+    plt.figure(figsize=(10, 6), dpi=300)  # Increase resolution with dpi=300
 
-# ----------------- NEW FIGURE 1: Network-scale observed vs imputed map (LEGEND, yearly vertical lines) -----------------
-network_fig_dir = "network_diagnostics"
-os.makedirs(network_fig_dir, exist_ok=True)
-
-# Station order: by GROUP then STATION (stable ordering improves readability)
-station_order = (final_data[['GROUP', 'STATION']]
-                 .drop_duplicates()
-                 .sort_values(['GROUP', 'STATION'])['STATION']
-                 .tolist())
-
-# Pivot: rows=stations, cols=dates, values=was_missing (True=imputed, False=observed)
-prov = (final_data
-        .pivot_table(index='STATION', columns='MSMT_DATE', values='was_missing', aggfunc='max')
-        .reindex(station_order)
-        .sort_index(axis=1))  # ensure dates are sorted left-to-right
-
-# Warn if there are months with no record for some stations (NaN in the map)
-if prov.isna().any().any():
-    print("Warning: Figure 1 provenance map contains NaN values "
-          "(some stations have months with no record in the plotted time domain).")
-
-# Convert to 0/1 for plotting (NaN remains NaN)
-prov_mat = prov.astype(float).values  # 0=observed, 1=imputed, NaN=no record
-nan_mask = np.isnan(prov_mat)
-
-# ---- Layered plotting to control z-order precisely:
-#      (0) background gray for NaNs
-#      (1) yearly vertical lines (in front of background, behind data)
-#      (2) observed/imputed pixels (NaNs transparent)
-fig, ax = plt.subplots(figsize=(12, 6), dpi=400)
-
-# (0) Background layer: show ONLY NaNs as light gray; everything else transparent
-bg = np.where(nan_mask, 1.0, np.nan)  # 1 where NaN, else NaN (transparent via set_bad)
-bg_cmap = ListedColormap(['lightgray'])
-bg_cmap.set_bad((0, 0, 0, 0))  # fully transparent for non-NaN
-ax.imshow(bg, aspect='auto', interpolation='nearest', cmap=bg_cmap, vmin=0, vmax=1, zorder=0)
-
-# Build year -> first column index mapping
-dates = prov.columns.to_list()
-year_first_idx = {}
-for i, d in enumerate(dates):
-    y = d.year
-    if y not in year_first_idx:
-        year_first_idx[y] = i
-
-# (1) Yearly vertical lines: several gray tones, behind data but in front of background
-for y, idx in year_first_idx.items():
-    # place line at the left edge of the first month for that year
-    x = idx - 0.5
-
-    # "a few gray tones": darker for decades, medium for 5-year marks, light otherwise
-    if y % 10 == 0:
-        col, lw = '0.55', 0.9
-    elif y % 5 == 0:
-        col, lw = '0.65', 0.7
-    else:
-        col, lw = '0.75', 0.5
-
-    ax.axvline(x=x, color=col, linewidth=lw, zorder=1)
-
-# (2) Data layer: observed/imputed; NaNs transparent so background shows through
-data_cmap = ListedColormap(['royalblue', 'yellow'])  # 0=Observed, 1=Imputed
-data_cmap.set_bad((0, 0, 0, 0))  # NaNs fully transparent in the data layer
-norm = BoundaryNorm([-0.5, 0.5, 1.5], data_cmap.N)
-ax.imshow(prov_mat, aspect='auto', interpolation='nearest', cmap=data_cmap, norm=norm, zorder=2)
-
-# X ticks: yearly (or every 2 years if too dense)
-years = sorted(year_first_idx.keys())
-tick_year_step = 2 if len(years) > 15 else 1
-xticks, xticklabels = [], []
-for y in years:
-    if (y - years[0]) % tick_year_step == 0:
-        xticks.append(year_first_idx[y])
-        xticklabels.append(str(y))
-
-ax.set_xticks(xticks)
-ax.set_xticklabels(xticklabels, rotation=0)
-ax.set_yticks([])  # too many stations; omit for clarity
-ax.set_xlabel("Year")
-ax.set_title("Network-Scale Provenance Map (Observed vs Imputed Months)")
-
-# Legend (upper left)
-legend_handles = [
-    Patch(facecolor='royalblue', edgecolor='k', label='Observed'),
-    Patch(facecolor='yellow', edgecolor='k', label='Imputed'),
-]
-ax.legend(handles=legend_handles, loc='upper left', frameon=True)
-
-fig.tight_layout()
-fig.savefig(os.path.join(network_fig_dir, "network_provenance_observed_vs_imputed.png"))
-fig.savefig(os.path.join(network_fig_dir, "network_provenance_observed_vs_imputed.pdf"))
-plt.close(fig)
-# ----------------- END NEW FIGURE 1 ------------------------------------------------------------------------
-
-
-# ----------------- NEW FIGURE 2: Contiguous gap-length distribution -----------------
-def contiguous_true_run_lengths(bool_array):
-    """Return lengths of contiguous True runs in a 1D boolean array."""
-    runs = []
-    run = 0
-    for v in bool_array:
-        if bool(v):
-            run += 1
-        else:
-            if run > 0:
-                runs.append(run)
-                run = 0
-    if run > 0:
-        runs.append(run)
-    return runs
-
-gap_lengths = []
-for st, sdf in final_data.sort_values('MSMT_DATE').groupby('STATION'):
-    mask = sdf['was_missing'].to_numpy()
-    gap_lengths.extend(contiguous_true_run_lengths(mask))
-
-gap_fig_dir = "network_diagnostics"
-os.makedirs(gap_fig_dir, exist_ok=True)
-
-if len(gap_lengths) > 0:
-    plt.figure(figsize=(10, 5), dpi=300)
-    # Bin up to, say, 60 months; longer gaps go to the tail automatically
-    max_len = max(gap_lengths)
-    upper = max(60, max_len)
-    bins = np.arange(1, upper + 2) - 0.5  # center bins on integers
-
-    plt.hist(gap_lengths, bins=bins, linewidth=0.5)
-    plt.axvline(12, linestyle='--', linewidth=1.0)
-    plt.axvline(24, linestyle='--', linewidth=1.0)
-
-    plt.xlabel("Contiguous gap length (months)")
-    plt.ylabel("Number of gaps")
-    plt.title("Distribution of Contiguous Missing-Data Gaps (All Wells)")
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(gap_fig_dir, "gap_length_distribution.png"))
-    plt.savefig(os.path.join(gap_fig_dir, "gap_length_distribution.pdf"))
-    plt.close()
-
-
-
-# --- Plotting helpers (dashed segments to missing points, hollow infilled markers,
-# --- and optional partitioned plots for long records; PNG + PDF export) -----------------
-def _record_span_years(date_series):
-    """Return the span of a time series in years (approx.), based on min/max dates."""
-    if date_series is None or len(date_series) == 0:
-        return 0.0
-    dmin = pd.to_datetime(date_series.min())
-    dmax = pd.to_datetime(date_series.max())
-    if pd.isna(dmin) or pd.isna(dmax):
-        return 0.0
-    return max(0.0, (dmax - dmin).days / 365.25)
-
-
-def _partition_date_ranges(date_series, threshold_2yrs=10.0, threshold_3yrs=30.0):
-    """Create (start,end,n_parts,part_index) partitions based on record length.
-    Full-series plot is handled separately; this returns ONLY additional partitions.
-    """
-    if date_series is None or len(date_series) == 0:
-        return []
-    dmin = pd.to_datetime(date_series.min())
-    dmax = pd.to_datetime(date_series.max())
-    if pd.isna(dmin) or pd.isna(dmax) or dmax <= dmin:
-        return []
-    span_years = (dmax - dmin).days / 365.25
-    if span_years > threshold_3yrs:
-        n_parts = 3
-    elif span_years > threshold_2yrs:
-        n_parts = 2
-    else:
-        return []
-
-    total_days = (dmax - dmin).days
-    edges = [dmin + pd.Timedelta(days=int(round(total_days * k / n_parts))) for k in range(n_parts + 1)]
-    edges[-1] = dmax
-
-    ranges = []
-    for p in range(n_parts):
-        start = edges[p]
-        end = edges[p + 1]
-        ranges.append((start, end, n_parts, p + 1))
-    return ranges
-
-
-def generate_time_series_graphs(station_data, station_name, file_stem=None, title_suffix=None):
-    station_data = station_data.copy()
-    station_data = station_data.sort_values('MSMT_DATE')
-
-    plt.figure(figsize=(10, 6), dpi=300)
-
-    # Line segments: dashed if segment touches an infilled point
+    # Plot the entire series with different colors for observed and estimated values
     for i in range(1, len(station_data)):
-        seg_has_missing = bool(station_data['was_missing'].iloc[i]) or bool(station_data['was_missing'].iloc[i-1])
-        if seg_has_missing:
-            color = 'lightsalmon'
-            linestyle = '--'
+        if station_data['was_missing'].iloc[i] and station_data['was_missing'].iloc[i-1]:
+            color = 'lightsalmon'  # Estimated-Estimated
+        elif station_data['was_missing'].iloc[i] or station_data['was_missing'].iloc[i-1]:
+            color = 'lightsalmon'  # Observed-Estimated or Estimated-Observed
         else:
-            color = 'lightskyblue'
-            linestyle = '-'
-        plt.plot(
-            station_data['MSMT_DATE'].iloc[i-1:i+1],
-            station_data['WSE_final'].iloc[i-1:i+1],
-            color=color,
-            linestyle=linestyle,
-            linewidth=0.8
-        )
+            color = 'lightskyblue'  # Observed-Observed
+        plt.plot(station_data['MSMT_DATE'].iloc[i-1:i+1], station_data['WSE_final'].iloc[i-1:i+1], color=color)
 
-    # Points: observed vs infilled
-    obs_mask = ~station_data['was_missing']
-    miss_mask = station_data['was_missing']
-
-    plt.plot(
-        station_data.loc[obs_mask, 'MSMT_DATE'],
-        station_data.loc[obs_mask, 'WSE_final'],
-        linestyle='None',
-        marker='o',
-        markersize=2,
-        color='royalblue',
-        label='Observed'
-    )
-
-    plt.plot(
-        station_data.loc[miss_mask, 'MSMT_DATE'],
-        station_data.loc[miss_mask, 'WSE_final'],
-        linestyle='None',
-        marker='o',
-        markersize=2,
-        markerfacecolor='white',
-        markeredgecolor='firebrick',
-        markeredgewidth=0.8,
-        label='Infilled'
-    )
+    # Plot the dots
+    plt.plot(station_data['MSMT_DATE'], station_data['WSE_final'], 'o', markersize=2, color='royalblue', label='Observed')
+    plt.plot(station_data.loc[station_data['was_missing'], 'MSMT_DATE'], station_data.loc[station_data['was_missing'], 'WSE_final'], 'o', markersize=2, color='firebrick', label='Infilled')
 
     plt.xlabel('')
     plt.ylabel('Water Surface Elevation (WSE)')
-
-    if title_suffix is None:
-        plt.title(f'Time Series Graph for Station {station_name}')
-    else:
-        plt.title(f'Time Series Graph for Station {station_name}{title_suffix}')
-
+    plt.title(f'Time Series Graph for Station {station_name}')
     plt.legend()
+    
+    # Add light gray gridlines in the background
     plt.grid(color='lightgray', linestyle='-', linewidth=0.5)
 
-    if file_stem is None:
-        file_stem = station_name
-
-    file_path_png = os.path.join(output_dir, f'{file_stem}.png')
-    file_path_pdf = os.path.join(output_dir, f'{file_stem}.pdf')
-
-    plt.savefig(file_path_png)
-    plt.savefig(file_path_pdf)
+    # Save the graph to a file in the output directory
+    file_path = os.path.join(output_dir, f'{station_name}.png')
+    plt.savefig(file_path)
     plt.close()
 
 # Generate time series graphs for each station and save infilled data for each station separately
-stations_all = final_data['STATION'].unique().tolist()
-for station in tqdm(stations_all, desc="Plotting stations", unit="station"):
+for station in final_data['STATION'].unique():
     station_data = final_data[final_data['STATION'] == station].copy()
     generate_time_series_graphs(station_data, station)
-
-    # Additional partitioned plots for long records (full-series plot is kept)
-    _ranges = _partition_date_ranges(station_data['MSMT_DATE'])
-    for (_start, _end, _n_parts, _pidx) in _ranges:
-        _subset = station_data[(station_data['MSMT_DATE'] >= _start) & (station_data['MSMT_DATE'] <= _end)].copy()
-        if not _subset.empty:
-            generate_time_series_graphs(
-                _subset,
-                station,
-                file_stem=f"{station}_part{_pidx}of{_n_parts}",
-                title_suffix=f" (Part {_pidx}/{_n_parts})"
-            )
 
     # Save infilled data for each station separately
     station_infilled_file_path = os.path.join(infilled_data_dir, f'{station}.csv')
@@ -448,107 +459,53 @@ for station in tqdm(stations_all, desc="Plotting stations", unit="station"):
     # Save estimated data for each station separately with time info
     estimated_series = station_data[station_data['was_missing']]
     estimated_file_path = os.path.join(estimated_data_dir, f'{station}.csv')
+
     if not estimated_series.empty:
         estimated_series.to_csv(estimated_file_path, columns=['MSMT_DATE', 'WSE_final'], index=False)
 
+# Function to generate time series graphs for each group with multiple series in different colors
+def generate_group_time_series_graphs(group_name, group_stations):
+    plt.figure(figsize=(10, 6), dpi=300)  # Increase resolution with dpi=300
 
-def generate_group_time_series_graphs(group_name, group_stations, file_stem=None, title_suffix=None):
-    plt.figure(figsize=(10, 6), dpi=300)
-
+    # Exclude tones of red from the colormap
     colors = plt.get_cmap('tab10')(np.linspace(0, 1, len(group_stations)))
-    colors = [c for c in colors if not (c[0] > 0.8 and c[1] < 0.3 and c[2] < 0.3)]
+    colors = [color for color in colors if not (color[0] > 0.8 and color[1] < 0.3 and color[2] < 0.3)]  # Exclude colors close to red
 
     for i, (station_name, station_data) in enumerate(group_stations.items()):
-        station_data = station_data.copy().sort_values('MSMT_DATE')
-
-        rgba_color = colors[i % len(colors)].tolist()
-        rgba_color[3] = 0.5
-
         for j in range(1, len(station_data)):
-            seg_has_missing = bool(station_data['was_missing'].iloc[j]) or bool(station_data['was_missing'].iloc[j-1])
-            if seg_has_missing:
-                color = 'lightsalmon'
-                linestyle = '--'
-                alpha = 1.0
+            if station_data['was_missing'].iloc[j] and station_data['was_missing'].iloc[j-1]:
+                color = 'lightsalmon'  # Estimated-Estimated
+            elif station_data['was_missing'].iloc[j] or station_data['was_missing'].iloc[j-1]:
+                color = 'lightsalmon'  # Observed-Estimated or Estimated-Observed
             else:
+                rgba_color = colors[i % len(colors)].tolist()
+                rgba_color[3] = 0.5  # Adjust the alpha value for lighter tone
                 color = rgba_color
-                linestyle = '-'
-                alpha = rgba_color[3]
+            plt.plot(station_data['MSMT_DATE'].iloc[j-1:j+1], station_data['WSE_final'].iloc[j-1:j+1], color=color)
 
-            plt.plot(
-                station_data['MSMT_DATE'].iloc[j-1:j+1],
-                station_data['WSE_final'].iloc[j-1:j+1],
-                color=color,
-                linestyle=linestyle,
-                linewidth=0.8,
-                alpha=alpha
-            )
-
-        obs_mask = ~station_data['was_missing']
-        miss_mask = station_data['was_missing']
-
-        plt.plot(
-            station_data.loc[obs_mask, 'MSMT_DATE'],
-            station_data.loc[obs_mask, 'WSE_final'],
-            linestyle='None',
-            marker='o',
-            markersize=2,
-            color=rgba_color,
-            label=station_name
-        )
-
-        plt.plot(
-            station_data.loc[miss_mask, 'MSMT_DATE'],
-            station_data.loc[miss_mask, 'WSE_final'],
-            linestyle='None',
-            marker='o',
-            markersize=2,
-            markerfacecolor='white',
-            markeredgecolor='firebrick',
-            markeredgewidth=0.8
-        )
+        # Plot the dots
+        plt.plot(station_data['MSMT_DATE'], station_data['WSE_final'], 'o', markersize=2, color=colors[i % len(colors)], label=f'{station_name} Observed')
+        plt.plot(station_data.loc[station_data['was_missing'], 'MSMT_DATE'], station_data.loc[station_data['was_missing'], 'WSE_final'], 'o', markersize=2, color='firebrick')
 
     plt.xlabel('')
     plt.ylabel('Water Surface Elevation (WSE)')
-
-    if title_suffix is None:
-        plt.title(f'Time Series Graph for Group {group_name}')
-    else:
-        plt.title(f'Time Series Graph for Group {group_name}{title_suffix}')
-
+    plt.title(f'Time Series Graph for Group {group_name}')
     plt.legend()
+    
+    # Add light gray gridlines in the background
     plt.grid(color='lightgray', linestyle='-', linewidth=0.5)
 
-    if file_stem is None:
-        file_stem = group_name
-
-    file_path_png = os.path.join(group_output_dir, f'{file_stem}.png')
-    file_path_pdf = os.path.join(group_output_dir, f'{file_stem}.pdf')
-
-    plt.savefig(file_path_png)
-    plt.savefig(file_path_pdf)
+    # Save the graph to a file in the group output directory
+    file_path = os.path.join(group_output_dir, f'{group_name}.png')
+    plt.savefig(file_path)
     plt.close()
 
 # Generate time series graphs for each group
-groups_all = final_data['GROUP'].unique().tolist()
-for group in tqdm(groups_all, desc="Plotting groups", unit="group"):
+for group in final_data['GROUP'].unique():
     group_data = final_data[final_data['GROUP'] == group]
-    group_stations = {st: group_data[group_data['STATION'] == st] for st in group_data['STATION'].unique()}
+    group_stations = {station: group_data[group_data['STATION'] == station] for station in group_data['STATION'].unique()}
     generate_group_time_series_graphs(group, group_stations)
 
-    _ranges_g = _partition_date_ranges(group_data['MSMT_DATE'])
-    for (_start, _end, _n_parts, _pidx) in _ranges_g:
-        _subset = group_data[(group_data['MSMT_DATE'] >= _start) & (group_data['MSMT_DATE'] <= _end)]
-        _group_stations_subset = {st: _subset[_subset['STATION'] == st] for st in _subset['STATION'].unique()}
-        if len(_group_stations_subset) > 0:
-            generate_group_time_series_graphs(
-                group,
-                _group_stations_subset,
-                file_stem=f"{group}_part{_pidx}of{_n_parts}",
-                title_suffix=f" (Part {_pidx}/{_n_parts})"
-            )
-
-print("Time series graphs have been generated and saved in the 'time_series_graphs_KNN' directory.")
-print("Infilled data files have been generated and saved in the 'infilled_data_KNN' directory.")
-print("Estimated data files have been generated and saved in the 'estimated_data_KNN' directory.")
-print("Group time series graphs have been generated and saved in the 'group_time_series_graphs_KNN' directory.")
+print(f"Time series graphs have been generated and saved in the 'time_series_graphs_KNN' directory.")
+print(f"Infilled data files have been generated and saved in the 'infilled_data_KNN' directory.")
+print(f"Estimated data files have been generated and saved in the 'estimated_data_KNN' directory.")
